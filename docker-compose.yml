@@ -1,0 +1,139 @@
+services:
+  database:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: publishflow
+      POSTGRES_USER: publishflow
+      POSTGRES_PASSWORD: publishflow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U publishflow -d publishflow"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - publishflow_postgres:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: publishflow
+      RABBITMQ_DEFAULT_PASS: publishflow
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    ports:
+      - "${PUBLISHFLOW_RABBITMQ_MANAGEMENT_PORT:-15683}:15672"
+
+  api:
+    build:
+      context: .
+      target: runtime
+    environment: &publishflow-environment
+      PUBLISHFLOW_DATABASE_URL: ${PUBLISHFLOW_DATABASE_URL:-postgresql+psycopg://publishflow:publishflow@database:5432/publishflow}
+      PUBLISHFLOW_RABBITMQ_URL: ${PUBLISHFLOW_RABBITMQ_URL:-amqp://publishflow:publishflow@rabbitmq:5672/%2F}
+      PUBLISHFLOW_JWT_SECRET: ${PUBLISHFLOW_JWT_SECRET:-local-publishflow-secret-change-me-at-least-32-bytes}
+      PUBLISHFLOW_ACCESS_TOKEN_EXPIRE_MINUTES: ${PUBLISHFLOW_ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      PUBLISHFLOW_ADMIN_EMAIL: ${PUBLISHFLOW_ADMIN_EMAIL:-admin@example.com}
+      PUBLISHFLOW_ADMIN_PASSWORD: ${PUBLISHFLOW_ADMIN_PASSWORD:-ChangeMe123!}
+      PUBLISHFLOW_EDITOR_EMAIL: ${PUBLISHFLOW_EDITOR_EMAIL:-editor@example.com}
+      PUBLISHFLOW_EDITOR_PASSWORD: ${PUBLISHFLOW_EDITOR_PASSWORD:-ChangeMe123!}
+      PUBLISHFLOW_LOG_LEVEL: ${PUBLISHFLOW_LOG_LEVEL:-INFO}
+    depends_on:
+      database:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    ports:
+      - "${PUBLISHFLOW_PORT:-8030}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  outbox-publisher:
+    build:
+      context: .
+      target: runtime
+    entrypoint: []
+    command: ["python", "-m", "publishflow.worker.publisher"]
+    environment: *publishflow-environment
+    depends_on:
+      api:
+        condition: service_healthy
+
+  import-worker:
+    build:
+      context: .
+      target: runtime
+    entrypoint: []
+    command: ["python", "-m", "publishflow.worker.importer"]
+    environment: *publishflow-environment
+    depends_on:
+      api:
+        condition: service_healthy
+
+  scheduler:
+    build:
+      context: .
+      target: runtime
+    entrypoint: []
+    command: ["python", "-m", "publishflow.worker.scheduler"]
+    environment: *publishflow-environment
+    depends_on:
+      api:
+        condition: service_healthy
+
+  database-test:
+    image: postgres:17-alpine
+    profiles: ["test"]
+    environment:
+      POSTGRES_DB: publishflow_test
+      POSTGRES_USER: publishflow
+      POSTGRES_PASSWORD: publishflow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U publishflow -d publishflow_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq-test:
+    image: rabbitmq:4-alpine
+    profiles: ["test"]
+    environment:
+      RABBITMQ_DEFAULT_USER: publishflow
+      RABBITMQ_DEFAULT_PASS: publishflow
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  test:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
+    environment:
+      PUBLISHFLOW_DATABASE_URL: postgresql+psycopg://publishflow:publishflow@database-test:5432/publishflow_test
+      PUBLISHFLOW_RABBITMQ_URL: amqp://publishflow:publishflow@rabbitmq-test:5672/%2F
+      PUBLISHFLOW_JWT_SECRET: test-publishflow-secret-at-least-32-bytes-long
+      PUBLISHFLOW_ADMIN_EMAIL: admin-test@example.com
+      PUBLISHFLOW_ADMIN_PASSWORD: TestAdmin123!
+      PUBLISHFLOW_EDITOR_EMAIL: editor-test@example.com
+      PUBLISHFLOW_EDITOR_PASSWORD: TestEditor123!
+    depends_on:
+      database-test:
+        condition: service_healthy
+      rabbitmq-test:
+        condition: service_healthy
+    command: ["sh", "-c", "alembic upgrade head && python -m publishflow.seed && pytest"]
+
+volumes:
+  publishflow_postgres:
