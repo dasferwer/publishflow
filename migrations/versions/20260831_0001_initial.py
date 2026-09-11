@@ -1,4 +1,4 @@
-"""Create PublishFlow schema.
+"""Создаём таблицы публикаций и фоновых заданий.
 
 Revision ID: 20260831_0001
 Revises:

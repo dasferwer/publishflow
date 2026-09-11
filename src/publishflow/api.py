@@ -52,11 +52,11 @@ def health(db: DbSession) -> dict[str, str]:
     rabbitmq = "ok"
     try:
         db.execute(text("SELECT 1"))
-    except Exception:  # pragma: no cover - defensive health reporting
+    except Exception:  # pragma: no cover - ответ health при сбое зависимости
         database = "error"
     try:
         check_connection()
-    except Exception:  # pragma: no cover - defensive health reporting
+    except Exception:  # pragma: no cover - ответ health при сбое зависимости
         rabbitmq = "error"
     if database != "ok" or rabbitmq != "ok":
         raise HTTPException(
