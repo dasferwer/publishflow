@@ -14,6 +14,8 @@ from publishflow.seed import seed_database
 
 @pytest.fixture(scope="session", autouse=True)
 def reset_database() -> Generator[None, None, None]:
+    if engine.url.database != "publishflow_test":
+        raise RuntimeError("Тесты разрешены только в БД publishflow_test")
     with engine.begin() as connection:
         connection.execute(
             text(

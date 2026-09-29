@@ -53,7 +53,7 @@ def test_import_job_keeps_valid_items_when_one_slug_exists(
     assert processed.status == ImportStatus.COMPLETED_WITH_ERRORS
     assert processed.processed_items == 2
     assert processed.failed_items == 1
-    assert [item.status.value for item in processed.items] == ["failed", "imported"]
+    assert [str(item.status) for item in processed.items] == ["failed", "imported"]
 
     with SessionLocal() as db:
         repeated = process_import_job(db, job_id)

@@ -91,6 +91,17 @@ class Article(UUIDMixin, TimestampMixin, Base):
             name="ck_articles_valid_status",
         ),
         CheckConstraint("current_version > 0", name="ck_articles_positive_version"),
+        CheckConstraint("revision > 0", name="ck_articles_positive_revision"),
+        CheckConstraint(
+            "status NOT IN ('approved','scheduled','published','archived') OR "
+            "(approved_version IS NOT NULL AND approved_version = current_version)",
+            name="ck_articles_approved_version",
+        ),
+        CheckConstraint(
+            "status NOT IN ('published','archived') OR "
+            "(published_version IS NOT NULL AND published_version = approved_version)",
+            name="ck_articles_published_version",
+        ),
         UniqueConstraint("slug", name="articles_slug_key"),
         Index("ix_articles_author_created", "author_id", "created_at"),
         Index("ix_articles_status_schedule", "status", "scheduled_at"),
@@ -105,6 +116,10 @@ class Article(UUIDMixin, TimestampMixin, Base):
     author_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
+    approved_version: Mapped[int | None] = mapped_column(Integer)
+    published_version: Mapped[int | None] = mapped_column(Integer)
+
     current_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -173,6 +188,7 @@ class ImportJob(UUIDMixin, Base):
             name="ck_import_jobs_valid_status",
         ),
         Index("ix_import_jobs_requester_created", "requested_by", "created_at"),
+        Index("ix_import_jobs_due", "status", "next_attempt_at"),
     )
 
     requested_by: Mapped[UUID] = mapped_column(
@@ -181,6 +197,11 @@ class ImportJob(UUIDMixin, Base):
     status: Mapped[ImportStatus] = mapped_column(
         String(40), default=ImportStatus.PENDING, nullable=False
     )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
     total_items: Mapped[int] = mapped_column(Integer, nullable=False)
     processed_items: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     failed_items: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

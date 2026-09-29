@@ -1,14 +1,23 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from publishflow.broker import check_connection
 from publishflow.dependencies import CurrentUser, DbSession, EditorUser
-from publishflow.models import Article, ArticleStatus, ArticleVersion, ImportJob, User, UserRole
+from publishflow.models import (
+    Article,
+    ArticleStatus,
+    ArticleVersion,
+    ImportJob,
+    ImportStatus,
+    User,
+    UserRole,
+)
 from publishflow.schemas import (
     ArticleCreate,
     ArticleDetail,
@@ -29,12 +38,14 @@ from publishflow.schemas import (
 from publishflow.security import create_access_token, hash_password, verify_password
 from publishflow.services import (
     EDITOR_ROLES,
+    add_outbox,
     archive_article,
     count_articles,
     create_article,
     create_import_job,
     get_article,
     get_import_job,
+    now_utc,
     publish_article,
     require_article_access,
     review_article,
@@ -44,6 +55,25 @@ from publishflow.services import (
 )
 
 router = APIRouter()
+
+
+def expected_revision(if_match: Annotated[str | None, Header()] = None) -> int:
+    if if_match is None:
+        raise HTTPException(status_code=428, detail="Передайте If-Match с текущей ревизией")
+    value = if_match[1:-1]
+    if (
+        len(if_match) > 20
+        or not if_match.startswith('"')
+        or not if_match.endswith('"')
+        or not value.isascii()
+        or not value.isdigit()
+        or int(value) < 1
+    ):
+        raise HTTPException(status_code=400, detail='Ожидается If-Match: "1"')
+    return int(value)
+
+
+Revision = Annotated[int, Depends(expected_revision)]
 
 
 @router.get("/health", tags=["service"])
@@ -145,9 +175,9 @@ def read_article(article_id: UUID, db: DbSession, user: CurrentUser) -> Article:
 
 @router.patch("/api/v1/articles/{article_id}", response_model=ArticleRead, tags=["articles"])
 def update_article_endpoint(
-    article_id: UUID, data: ArticleUpdate, db: DbSession, user: CurrentUser
+    article_id: UUID, data: ArticleUpdate, db: DbSession, user: CurrentUser, revision: Revision
 ) -> Article:
-    return update_article(db, get_article(db, article_id), user, data)
+    return update_article(db, get_article(db, article_id), user, data, revision)
 
 
 @router.get(
@@ -172,8 +202,10 @@ def list_versions(article_id: UUID, db: DbSession, user: CurrentUser) -> list[Ar
     response_model=ArticleRead,
     tags=["workflow"],
 )
-def submit_article_endpoint(article_id: UUID, db: DbSession, user: CurrentUser) -> Article:
-    return submit_article(db, get_article(db, article_id), user)
+def submit_article_endpoint(
+    article_id: UUID, db: DbSession, user: CurrentUser, revision: Revision
+) -> Article:
+    return submit_article(db, get_article(db, article_id), user, revision)
 
 
 @router.post(
@@ -182,9 +214,11 @@ def submit_article_endpoint(article_id: UUID, db: DbSession, user: CurrentUser) 
     tags=["workflow"],
 )
 def review_article_endpoint(
-    article_id: UUID, data: ReviewRequest, db: DbSession, editor: EditorUser
+    article_id: UUID, data: ReviewRequest, db: DbSession, editor: EditorUser, revision: Revision
 ) -> Article:
-    return review_article(db, get_article(db, article_id), editor, data.action, data.reason)
+    return review_article(
+        db, get_article(db, article_id), editor, data.action, data.reason, revision
+    )
 
 
 @router.post(
@@ -193,9 +227,9 @@ def review_article_endpoint(
     tags=["workflow"],
 )
 def schedule_article_endpoint(
-    article_id: UUID, data: ScheduleRequest, db: DbSession, editor: EditorUser
+    article_id: UUID, data: ScheduleRequest, db: DbSession, editor: EditorUser, revision: Revision
 ) -> Article:
-    return schedule_article(db, get_article(db, article_id), editor, data.publish_at)
+    return schedule_article(db, get_article(db, article_id), editor, data.publish_at, revision)
 
 
 @router.post(
@@ -203,8 +237,10 @@ def schedule_article_endpoint(
     response_model=ArticleRead,
     tags=["workflow"],
 )
-def publish_article_endpoint(article_id: UUID, db: DbSession, editor: EditorUser) -> Article:
-    return publish_article(db, get_article(db, article_id), editor)
+def publish_article_endpoint(
+    article_id: UUID, db: DbSession, editor: EditorUser, revision: Revision
+) -> Article:
+    return publish_article(db, get_article(db, article_id), editor, revision)
 
 
 @router.post(
@@ -212,8 +248,10 @@ def publish_article_endpoint(article_id: UUID, db: DbSession, editor: EditorUser
     response_model=ArticleRead,
     tags=["workflow"],
 )
-def archive_article_endpoint(article_id: UUID, db: DbSession, editor: EditorUser) -> Article:
-    return archive_article(db, get_article(db, article_id), editor)
+def archive_article_endpoint(
+    article_id: UUID, db: DbSession, editor: EditorUser, revision: Revision
+) -> Article:
+    return archive_article(db, get_article(db, article_id), editor, revision)
 
 
 @router.get("/api/v1/public/articles", response_model=list[PublicArticle], tags=["public"])
@@ -225,7 +263,7 @@ def list_public_articles(
         .join(
             ArticleVersion,
             (ArticleVersion.article_id == Article.id)
-            & (ArticleVersion.version == Article.current_version),
+            & (ArticleVersion.version == Article.published_version),
         )
         .where(Article.status == ArticleStatus.PUBLISHED)
         .order_by(Article.published_at.desc())
@@ -251,7 +289,7 @@ def read_public_article(slug: str, db: DbSession) -> PublicArticle:
         .join(
             ArticleVersion,
             (ArticleVersion.article_id == Article.id)
-            & (ArticleVersion.version == Article.current_version),
+            & (ArticleVersion.version == Article.published_version),
         )
         .where(Article.slug == slug, Article.status == ArticleStatus.PUBLISHED)
     ).one_or_none()
@@ -295,3 +333,33 @@ def list_import_jobs(db: DbSession, editor: EditorUser) -> list[object]:
 def read_import_job(job_id: UUID, db: DbSession, editor: EditorUser) -> object:
     del editor
     return get_import_job(db, job_id)
+
+
+class RetryImportRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    reason: str = Field(min_length=5, max_length=500)
+
+
+@router.post("/api/v1/import-jobs/{job_id}/retry", response_model=ImportJobRead, tags=["imports"])
+def retry_import(
+    job_id: UUID, data: RetryImportRequest, db: DbSession, editor: EditorUser
+) -> ImportJob:
+    job = db.scalar(select(ImportJob).where(ImportJob.id == job_id).with_for_update())
+    if job is None:
+        raise HTTPException(status_code=404, detail="Задание импорта не найдено")
+    if job.status != ImportStatus.FAILED:
+        raise HTTPException(status_code=409, detail="Повтор разрешён только после сбоя задания")
+    job.status = ImportStatus.PENDING
+    job.attempts, job.error = 0, None
+    job.next_attempt_at = now_utc()
+    add_outbox(
+        db,
+        "content.import.requested",
+        {
+            "job_id": str(job.id),
+            "actor_id": str(editor.id),
+            "reason": data.reason,
+        },
+    )
+    db.commit()
+    return get_import_job(db, job.id)

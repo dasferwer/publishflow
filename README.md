@@ -1,114 +1,127 @@
 # PublishFlow
 
-Backend редакционной платформы: версии материалов, согласование редактором,
-отложенная публикация и пакетный импорт через RabbitMQ.
+API редакционной платформы: версии материалов, согласование редактором,
+отложенная публикация и пакетный импорт. PostgreSQL хранит состояние и историю,
+RabbitMQ передаёт события, отдельные workers выполняют фоновые операции.
 
 ## История проекта
 
-- первоначальная разработка: август 2024 — апрель 2025 года (период указан
-  приблизительно);
-- подготовка и публикация портфолио-версии: август 2026 года.
+- Первоначальная разработка: август 2024 — апрель 2025 года, приблизительно.
+- Подготовка портфолио-версии: август 2026 года.
+- Защита согласования и восстановление импорта: сентябрь 2026 года.
 
-Репозиторий содержит актуализированную и документированную версию проекта,
-подготовленную для публичного портфолио.
+Проект предназначен для портфолио. Production-эксплуатация и работа под
+определённой нагрузкой не заявляются.
 
 ## Возможности
 
-- регистрация и JWT-аутентификация;
-- роли `author`, `editor` и `admin`;
-- неизменяемая история версий статьи;
-- workflow `draft → in_review → approved → scheduled → published`;
-- возврат материала автору с обязательной причиной;
-- автоматическая публикация по времени отдельным scheduler-процессом;
-- публичная выдача только опубликованных материалов;
-- асинхронный пакетный импорт до 100 статей;
-- частичный успех импорта: ошибка одной строки не откатывает остальные;
-- transactional outbox и идемпотентный import worker;
-- PostgreSQL, RabbitMQ, Alembic, OpenAPI, healthcheck и тесты.
+- JWT-аутентификация, роли `author`, `editor`, `admin`.
+- История версий текста и отдельная ревизия состояния материала.
+- Защита от потери изменений при конкурентных запросах.
+- Согласование конкретной версии; публикация только согласованного текста.
+- Планировщик с блокировкой строк и ограничением размера пакета.
+- Импорт до 100 материалов и 2 МБ текста за запрос, сохранение прогресса по строкам.
+- Продолжение импорта после сбоя, задержка повторов и ручной перезапуск.
+- Атомарные изменения, история и outbox; подтверждения RabbitMQ и карантин сообщений.
+- Миграции, воспроизводимый Compose-стенд и GitHub Actions.
 
-## Жизненный цикл статьи
+## Запуск
 
-```mermaid
-stateDiagram-v2
-    [*] --> draft
-    draft --> in_review: author submits
-    in_review --> changes_requested: editor requests changes
-    changes_requested --> in_review: author updates and submits
-    in_review --> approved: editor approves
-    approved --> scheduled: editor sets time
-    approved --> published: editor publishes now
-    scheduled --> published: scheduler or editor
-    published --> archived: editor archives
-```
-
-Каждое редактирование создаёт новую запись `article_versions`; опубликованная
-версия не переписывается. Недопустимые переходы возвращают `409 Conflict`.
-
-## Архитектура
-
-```mermaid
-flowchart LR
-    User[Author / Editor] --> API[FastAPI]
-    Reader[Public reader] --> API
-    API --> DB[(PostgreSQL)]
-    DB --> Publisher[Outbox publisher]
-    Publisher --> MQ[(RabbitMQ)]
-    MQ --> Importer[Import worker]
-    Importer --> DB
-    Scheduler[Scheduler] --> DB
-```
-
-API атомарно сохраняет бизнес-изменение и событие в outbox. Publisher повторяет
-доставку при недоступности RabbitMQ. Import worker безопасно повторно принимает
-одно событие и пропускает уже завершённое задание.
-
-## Быстрый запуск
+Нужны Docker и Docker Compose. Для локальных Python-проверок — Python 3.12+ и uv.
 
 ```bash
-docker compose up --build --detach
+docker compose up --build -d --wait api outbox-publisher import-worker scheduler
 ```
 
-После запуска:
+Сервис `migrate` применяет миграции и создаёт отсутствующие демонстрационные
+учётные записи. Пароли и роли существующих пользователей не перезаписываются.
+API и workers работают под UID 10001. PostgreSQL и RabbitMQ используют постоянные тома.
 
-- Swagger UI: <http://localhost:8030/docs>;
-- healthcheck: <http://localhost:8030/health>;
-- RabbitMQ Management: <http://localhost:15683>.
+- Swagger UI: <http://localhost:8030/docs>
+- Healthcheck: <http://localhost:8030/health>
+- RabbitMQ Management: <http://localhost:15683>, локальные реквизиты `publishflow` / `publishflow`.
 
-Демонстрационные учётные записи:
-
-```text
-admin@example.com / ChangeMe123!
-editor@example.com / ChangeMe123!
-```
-
-Авторы регистрируются через `POST /api/v1/auth/register`. Для внешнего
-окружения скопируйте `.env.example` в `.env` и замените все секреты.
-
-## Тесты и проверки
+Демонстрационные пользователи: `admin@example.com` и `editor@example.com`,
+пароль — `ChangeMe123!`. Порты привязаны к `127.0.0.1`.
+Параметры подключений, JWT, пользователей и портов перечислены в [.env.example](.env.example).
+Для внешнего окружения задайте собственные секреты и HTTPS.
 
 ```bash
-docker compose --profile test up --build \
-  --abort-on-container-exit --exit-code-from test test
-docker compose rm --stop --force --volumes test database-test rabbitmq-test
+docker compose down
 ```
 
+Данные сохраняются при остановке. `down -v` удаляет тома PostgreSQL и RabbitMQ.
+
+## Согласование и версии
+
+`current_version` — версия текста, `revision` — ревизия состояния всей статьи.
+Редактирование текста увеличивает оба значения, переход статуса — только `revision`.
+`approved_version` фиксирует согласованный текст, `published_version` — опубликованный.
+
+Все изменения существующего материала требуют `If-Match: "N"`, где `N` —
+текущая `revision` из ответа API. Отсутствие заголовка даёт `428`, неправильный
+формат — `400`, устаревшая ревизия — `412`. HTTP ETag сервер не выдаёт;
+значение заголовка берётся из JSON-поля. Старые клиенты нужно обновить.
+
+1. `POST /api/v1/auth/register`, затем `POST /api/v1/auth/login` — получить токен.
+2. `POST /api/v1/articles` — создать черновик с `slug`, `title`, `summary`, `body`.
+3. `PATCH /api/v1/articles/{id}` — создать новую версию текста.
+4. `POST /api/v1/articles/{id}/submit` — отправить текущую версию редактору.
+5. `POST /api/v1/articles/{id}/review` — `approve` либо `request_changes` с причиной.
+6. `POST /api/v1/articles/{id}/schedule` — назначить `publish_at` с часовым поясом;
+   либо `POST /api/v1/articles/{id}/publish` — опубликовать сразу.
+7. `POST /api/v1/articles/{id}/archive` — снять опубликованный материал с выдачи.
+
+Редактирование разрешено только в `draft` и `changes_requested`.
+Редактор не может согласовать текст по устаревшей ревизии после нового цикла правок.
+Публичные маршруты `/api/v1/public/articles` и `/api/v1/public/articles/{slug}`
+возвращают текст именно `published_version`; черновики и архивные статьи скрыты.
+Список публичных материалов ограничивается параметром `limit`.
+
+## Импорт и восстановление
+
+`POST /api/v1/import-jobs` принимает `items` и возвращает `202` с ID задания.
+Состояние доступно через `GET /api/v1/import-jobs/{id}`. Маршруты импорта доступны
+редакторам и администраторам; это единая редакция, без разделения на организации.
+
+Создание статьи, её версии, истории, outbox и результата строки фиксируется
+одной транзакцией. Следующая строка обрабатывается отдельно. Конфликт `slug`
+помечает строку как неудачную, остальные продолжают обрабатываться.
+
+После технического сбоя готовые строки сохраняются. Worker выбирает незавершённые
+задания из БД, поэтому потеря сообщения брокера не оставляет импорт без обработки.
+До пяти зарегистрированных сбоев задание повторяется с задержкой, затем получает
+`failed`. Редактор может вызвать `POST /api/v1/import-jobs/{id}/retry` с
+`{"reason":"Причина повтора"}`. Готовые строки не выполняются повторно, автор
+действия и причина сохраняются в событии outbox. Строки с занятым `slug` не
+переоткрываются этим действием: исправленный материал отправляется новым импортом.
+
+RabbitMQ содержит три очереди:
+
+- `publishflow.imports` — уведомления о заданиях;
+- `publishflow.imports.invalid` — сообщения с некорректным форматом или ссылкой на задание;
+- `publishflow.article-events` — подтверждённые события статей для будущих потребителей.
+
+Последняя очередь не имеет встроенного потребителя и политики очистки. Следите
+за её размером или подключите потребителя. Publisher использует `mandatory`
+и подтверждения брокера; неудачная публикация остаётся в outbox. Дубли событий
+после неопределённого результата публикации возможны, обработка импорта их переносит.
+
+## Проверки
+
 ```bash
-uv sync --extra dev
+uv sync --frozen --extra dev
 uv run ruff format --check .
 uv run ruff check .
 uv run mypy src
+
+docker compose --profile test build test
+docker compose --profile test run --rm test
+docker compose --profile test run --rm test python scripts/check_migration.py
 ```
 
-## Стек
+Тесты очищают только `publishflow_test`. Скрипт миграции откатывает новую ревизию
+и применяет её снова, сверяя исторические поля; тестовые ревизии и счётчики попыток
+при этом сбрасываются. На рабочей БД его запуск запрещён.
 
-Python 3.12, FastAPI, Pydantic, SQLAlchemy 2, PostgreSQL 17, RabbitMQ, Pika,
-JWT/RBAC, Alembic, Docker Compose, pytest, HTTPX2, Ruff и mypy.
-
-Архитектурные решения и сценарии отказа: [`docs/architecture.md`](./docs/architecture.md).
-
-## English summary
-
-PublishFlow is a containerized editorial-workflow backend with immutable
-article versions, role-based review, scheduled publishing and asynchronous
-batch imports. A transactional outbox bridges PostgreSQL and RabbitMQ, while
-the import worker supports idempotent retries and per-item failures.
+[Архитектура](docs/architecture.md), [результаты проверок](docs/verification.md).

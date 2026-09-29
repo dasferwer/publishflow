@@ -6,6 +6,9 @@ import pika
 
 from publishflow.config import get_settings
 
+INVALID_QUEUE = "publishflow.imports.invalid"
+ARTICLE_QUEUE = "publishflow.article-events"
+
 EXCHANGE = "publishflow.events"
 IMPORT_QUEUE = "publishflow.imports"
 
@@ -22,6 +25,9 @@ def connect() -> pika.BlockingConnection:
 def declare_topology(channel: pika.channel.Channel) -> None:
     channel.exchange_declare(exchange=EXCHANGE, exchange_type="topic", durable=True)
     channel.queue_declare(queue=IMPORT_QUEUE, durable=True)
+    channel.queue_declare(queue=INVALID_QUEUE, durable=True)
+    channel.queue_declare(queue=ARTICLE_QUEUE, durable=True)
+    channel.queue_bind(queue=ARTICLE_QUEUE, exchange=EXCHANGE, routing_key="article.#")
     channel.queue_bind(
         queue=IMPORT_QUEUE,
         exchange=EXCHANGE,
@@ -40,7 +46,7 @@ def publish_event(channel: pika.channel.Channel, event_type: str, body: Mapping[
             message_id=str(body["event_id"]),
             type=event_type,
         ),
-        mandatory=False,
+        mandatory=True,
     )
 
 

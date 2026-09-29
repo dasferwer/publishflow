@@ -5,45 +5,64 @@ from uuid import UUID
 
 import pika
 
-from publishflow.broker import IMPORT_QUEUE, connect, declare_topology
+from publishflow.broker import IMPORT_QUEUE, INVALID_QUEUE, connect, declare_topology
 from publishflow.db import SessionLocal
-from publishflow.services import process_import_job
+from publishflow.models import ImportJob, OutboxEvent
+from publishflow.services import process_next_import
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-logging.getLogger("pika").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
-def handle_message(
-    channel: pika.channel.Channel,
-    method: pika.spec.Basic.Deliver,
-    properties: pika.BasicProperties,
-    body: bytes,
-) -> None:
-    del properties
+def consume_one(channel: pika.channel.Channel) -> bool:
+    method, _properties, body = channel.basic_get(IMPORT_QUEUE, auto_ack=False)
+    if method is None:
+        return False
     try:
         payload = json.loads(body)
+        if not isinstance(payload, dict) or not all(
+            isinstance(payload.get(key), str) for key in ("event_id", "job_id")
+        ):
+            raise ValueError("ID события и задания должны быть строками")
+        event_id, job_id = UUID(payload["event_id"]), UUID(payload["job_id"])
         with SessionLocal() as db:
-            process_import_job(db, UUID(payload["job_id"]))
-        channel.basic_ack(delivery_tag=method.delivery_tag)
-    except Exception:
-        logger.exception("Import job failed")
-        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            event = db.get(OutboxEvent, event_id)
+            if (
+                event is None
+                or event.event_type != "content.import.requested"
+                or event.payload.get("job_id") != str(job_id)
+                or db.get(ImportJob, job_id) is None
+            ):
+                raise ValueError("Задание не соответствует событию outbox")
+    except (ValueError, KeyError, TypeError):
+        channel.basic_publish(
+            exchange="",
+            routing_key=INVALID_QUEUE,
+            body=body,
+            properties=pika.BasicProperties(delivery_mode=2),
+            mandatory=True,
+        )
+    # Задание хранится в БД и не зависит от повторной доставки сообщения.
+    channel.basic_ack(method.delivery_tag)
+    return True
 
 
 def run() -> None:
+    logging.basicConfig(level=logging.INFO)
+    logging.getLogger("pika").setLevel(logging.WARNING)
     while True:
-        connection: pika.BlockingConnection | None = None
+        connection = None
         try:
+            process_next_import()
             connection = connect()
             channel = connection.channel()
             declare_topology(channel)
-            channel.basic_qos(prefetch_count=1)
-            channel.basic_consume(queue=IMPORT_QUEUE, on_message_callback=handle_message)
-            logger.info("Import worker is ready")
-            channel.start_consuming()
-        except Exception:
-            logger.exception("Import worker lost its connection; retrying")
+            channel.confirm_delivery()
+            while connection.is_open:
+                consumed = consume_one(channel)
+                worked = process_next_import()
+                connection.process_data_events(time_limit=0 if consumed or worked else 1)
+        except Exception as exc:
+            logger.warning("import_retry kind=%s", type(exc).__name__)
             time.sleep(3)
         finally:
             if connection is not None and connection.is_open:

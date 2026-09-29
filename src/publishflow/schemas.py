@@ -35,6 +35,8 @@ class UserRead(BaseModel):
 
 
 class ArticleCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
     slug: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$", min_length=3, max_length=160)
     title: str = Field(min_length=3, max_length=240)
     summary: str = Field(min_length=3, max_length=500)
@@ -42,6 +44,8 @@ class ArticleCreate(BaseModel):
 
 
 class ArticleUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
     title: str | None = Field(default=None, min_length=3, max_length=240)
     summary: str | None = Field(default=None, min_length=3, max_length=500)
     body: str | None = Field(default=None, min_length=10, max_length=100_000)
@@ -62,6 +66,9 @@ class ArticleRead(BaseModel):
     summary: str
     status: ArticleStatus
     author_id: UUID
+    revision: int
+    approved_version: int | None
+    published_version: int | None
     current_version: int
     scheduled_at: datetime | None
     published_at: datetime | None
@@ -107,6 +114,8 @@ class ArticleDetail(ArticleRead):
 
 
 class ReviewRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
     action: Literal["approve", "request_changes"]
     reason: str | None = Field(default=None, max_length=1000)
 
@@ -131,6 +140,8 @@ class PublicArticle(BaseModel):
 
 
 class ImportArticle(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
     slug: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$", min_length=3, max_length=160)
     title: str = Field(min_length=3, max_length=240)
     summary: str = Field(min_length=3, max_length=500)
@@ -139,6 +150,13 @@ class ImportArticle(BaseModel):
 
 class ImportJobCreate(BaseModel):
     items: list[ImportArticle] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def limit_content_size(self) -> "ImportJobCreate":
+        size = sum(len((item.title + item.summary + item.body).encode()) for item in self.items)
+        if size > 2_000_000:
+            raise ValueError("Суммарный размер текстов не должен превышать 2 МБ")
+        return self
 
 
 class ImportItemRead(BaseModel):
@@ -160,6 +178,8 @@ class ImportJobRead(BaseModel):
     requested_by: UUID
     status: ImportStatus
     total_items: int
+    attempts: int
+    next_attempt_at: datetime
     processed_items: int
     failed_items: int
     error: str | None

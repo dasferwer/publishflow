@@ -16,7 +16,7 @@ def test_article_version_and_workflow(
 
     update = client.patch(
         f"/api/v1/articles/{article_id}",
-        headers=author["headers"],
+        headers={**author["headers"], "If-Match": '"1"'},
         json={"body": "The revised body explains retries, idempotency and monitoring clearly."},
     )
     assert update.status_code == 200
@@ -26,17 +26,21 @@ def test_article_version_and_workflow(
     assert versions.status_code == 200
     assert [item["version"] for item in versions.json()] == [1, 2]
 
-    submitted = client.post(f"/api/v1/articles/{article_id}/submit", headers=author["headers"])
+    submitted = client.post(
+        f"/api/v1/articles/{article_id}/submit", headers={**author["headers"], "If-Match": '"2"'}
+    )
     assert submitted.json()["status"] == "in_review"
 
     approved = client.post(
         f"/api/v1/articles/{article_id}/review",
-        headers=editor_headers,
+        headers={**editor_headers, "If-Match": '"3"'},
         json={"action": "approve"},
     )
     assert approved.json()["status"] == "approved"
 
-    published = client.post(f"/api/v1/articles/{article_id}/publish", headers=editor_headers)
+    published = client.post(
+        f"/api/v1/articles/{article_id}/publish", headers={**editor_headers, "If-Match": '"4"'}
+    )
     assert published.json()["status"] == "published"
 
     public = client.get(f"/api/v1/public/articles/{article['slug']}")
@@ -67,11 +71,13 @@ def test_request_changes_requires_reason(
 ) -> None:
     author = register_author()
     article = create_article(author["headers"])
-    client.post(f"/api/v1/articles/{article['id']}/submit", headers=author["headers"])
+    client.post(
+        f"/api/v1/articles/{article['id']}/submit", headers={**author["headers"], "If-Match": '"1"'}
+    )
 
     response = client.post(
         f"/api/v1/articles/{article['id']}/review",
-        headers=editor_headers,
+        headers={**editor_headers, "If-Match": '"2"'},
         json={"action": "request_changes"},
     )
 

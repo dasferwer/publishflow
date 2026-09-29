@@ -1,48 +1,89 @@
-# PublishFlow architecture decisions
+# Архитектура PublishFlow
 
-## Immutable versions
+## Версия текста и согласование
 
-`articles` contains the current workflow state and searchable metadata.
-`article_versions` stores complete immutable snapshots. Editing a draft creates
-the next numbered version in the same transaction, so audit and rollback tools
-can be added without reconstructing content from diffs.
+`ArticleVersion` хранит снимок текста. API добавляет версии и не изменяет существующие.
+`Article.current_version` ссылается на текущий снимок; `revision` увеличивается
+при каждом изменении текста или статуса. Все HTTP-изменения проверяют `If-Match`
+после блокировки и перечитывания строки статьи.
 
-## Explicit workflow
+Согласование сохраняет `approved_version` в той же транзакции, что и статус,
+история и outbox. Публикация копирует её в `published_version`. Ограничения БД
+требуют совпадения согласованной и текущей версии для согласованных, запланированных,
+опубликованных и архивных статей. Для опубликованных и архивных записей также
+требуется совпадение опубликованной и согласованной версии.
 
-State transitions live in the service layer instead of arbitrary status
-updates. Authors can edit their own drafts and submit them. Editors approve,
-request changes, schedule, publish and archive. Every transition appends an
-`article_history` row with actor, previous state, new state and details.
+Планировщик выбирает до 100 наступивших публикаций через `FOR UPDATE SKIP LOCKED`.
+HTTP-публикация использует ту же блокировку строки. Поэтому гонка планировщика
+и редактора не создаёт два события публикации; устаревший HTTP-запрос получает `412`.
+Публичная выдача соединяет статью с `published_version`, а не с произвольным последним текстом.
 
-## Transactional outbox
+## Импорт
 
-A request never attempts a database commit and RabbitMQ publish as two unrelated
-writes. The domain record and `outbox_events` row commit together. A separate
-publisher uses `FOR UPDATE SKIP LOCKED`, publishes persistent messages and only
-then records `published_at`.
+Задание и все входные строки сохраняются до возврата `202`; одновременно записывается
+событие outbox. Worker обрабатывает не более десяти строк за одну итерацию,
+фиксируя каждую строку отдельной транзакцией. Блокировка задания сериализует
+его изменение между workers; разные задания могут выполняться параллельно.
 
-## Batch import
+Savepoint изолирует конфликт уникального `slug`. Только это ограничение переводится
+в ошибку строки; прочие ошибки не маскируются под занятый адрес. Создание статьи,
+версии, истории, outbox, результата строки и обновление счётчиков атомарны.
+Падение до commit откатывает одну строку, после commit повтор увидит её готовой.
 
-Import requests persist the job and every input item before publishing
-`content.import.requested`. The consumer locks the job, recognizes terminal
-states on redelivery, and handles each row in a nested transaction. Duplicate
-slugs are marked failed without rolling back valid rows.
+Технический сбой увеличивает счётчик попыток и переносит следующую попытку.
+После пяти зарегистрированных сбоев задание переходит в `failed`. Если сама БД
+недоступна, записать попытку невозможно: процесс ждёт и повторяет подключение.
+Ручной повтор требует права редактора, состояния `failed` и причины; готовые
+строки сохраняются, счётчик технических сбоев сбрасывается.
 
-## Scheduler
+PostgreSQL — источник состояния задания. Очередь RabbitMQ служит уведомлением,
+но worker также опрашивает незавершённые задания в БД. Поэтому импорт продолжится
+даже после утраты или подтверждения сообщения. Состояние `processing` не является
+долгоживущей блокировкой: после падения оно снова доступно worker.
 
-The scheduler selects due rows with `FOR UPDATE SKIP LOCKED`. Several scheduler
-replicas can therefore run without publishing one article twice. The automatic
-transition, audit record and outbox event commit atomically.
+## События и диагностика
 
-## Failure scenarios
+Publisher выбирает outbox через `SKIP LOCKED`, включает publisher confirms и
+проверяет маршрутизацию через `mandatory`. `published_at` ставится после подтверждения.
+При обрыве связи событие может прийти повторно. События статей сохраняются в
+отдельной durable-очереди; для неё требуется потребитель или политика хранения.
 
-| Failure | Behaviour |
-|---|---|
-| PostgreSQL unavailable | API healthcheck fails; no partial write is accepted |
-| RabbitMQ unavailable | Committed outbox rows remain pending for retry |
-| Publisher restarts after publish | Consumer-side job state makes redelivery safe |
-| Import contains a duplicate slug | That item fails; valid items still import |
-| Import worker crashes mid-job | Pending items are completed on redelivery |
-| Two schedulers select due content | Row locks let only one process each article |
-| Author reads another author's draft | API returns `403 Forbidden` |
-| Invalid workflow transition | API returns `409 Conflict` |
+Worker проверяет ID события и задания по БД. Неправильный формат или несоответствие
+outbox направляются в карантин; подтверждение исходного сообщения происходит
+после подтверждения записи в карантин. Ошибки БД оставляют сообщение неподтверждённым.
+
+Логи API содержат серверный ID запроса, шаблон маршрута, код ответа и длительность.
+SQL-ошибки доступности и тайм-ауты дают `503` с `Retry-After: 1`.
+Ожидание блокировки ограничено тремя секундами, SQL-запроса — десятью,
+подключения и соединения из пула — пятью. В диагностике outbox хранится тип
+исключения без тела статьи и параметров подключения.
+
+Для контроля накопления работы:
+
+```sql
+SELECT status, count(*), min(next_attempt_at)
+FROM import_jobs GROUP BY status;
+
+SELECT count(*), min(created_at)
+FROM outbox_events WHERE published_at IS NULL;
+```
+
+## Миграция и ограничения
+
+Остановите API и workers, создайте резервную копию и примените Alembic отдельным
+процессом. Новая миграция сохраняет бизнес-данные. Для уже согласованных и
+опубликованных материалов она фиксирует текущую историческую версию; это
+не восстанавливает отсутствующие доказательства согласования старых версий.
+Ревизия существующей статьи начинается с 1. Смешанный запуск старого и нового API
+не поддерживается: старый код не проверяет ревизии и новые ограничения.
+
+Откат удаляет ревизии и сведения о согласованном снимке, сбрасывает состояние повторов
+импорта. После начала работы новой версии предпочтительна исправляющая миграция.
+Автоматическая проверка отката выполняется только на тестовых данных.
+
+Нет нагрузочных замеров, квот API, автоматической очистки истории, outbox и очередей,
+HA-кластера и проверенного восстановления резервной копии. Импорт принимает JSON
+целиком, а не потоковый файл; ограничение 2 МБ относится к сумме текстов после разбора.
+Не реализованы перепубликация архивной статьи, отмена расписания и строгий порядок
+внешнего потребления событий. Publisher удерживает транзакцию на время отправки
+пакета — для больших потоков потребуется иной механизм выдачи заданий.

@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -68,12 +68,23 @@ def require_article_access(article: Article, user: User) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
 
+def lock_article(db: Session, article: Article, user: User, revision: int) -> None:
+    require_article_access(article, user)
+    db.refresh(article, with_for_update=True)
+    if article.revision != revision:
+        raise HTTPException(
+            status_code=412, detail="Материал уже изменён; получите актуальную ревизию"
+        )
+
+
 def article_payload(article: Article) -> dict[str, object]:
     return {
         "article_id": str(article.id),
         "slug": article.slug,
         "status": str(article.status),
         "version": article.current_version,
+        "revision": article.revision,
+        "approved_version": article.approved_version,
     }
 
 
@@ -87,9 +98,11 @@ def create_article(db: Session, user: User, data: ArticleCreate) -> Article:
     db.add(article)
     try:
         db.flush()
-    except IntegrityError:
+    except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Slug already exists") from None
+        if getattr(getattr(exc.orig, "diag", None), "constraint_name", None) != "articles_slug_key":
+            raise
+        raise HTTPException(status_code=409, detail="Slug уже занят") from exc
     db.add(
         ArticleVersion(
             article_id=article.id,
@@ -107,8 +120,10 @@ def create_article(db: Session, user: User, data: ArticleCreate) -> Article:
     return article
 
 
-def update_article(db: Session, article: Article, user: User, data: ArticleUpdate) -> Article:
-    require_article_access(article, user)
+def update_article(
+    db: Session, article: Article, user: User, data: ArticleUpdate, revision: int
+) -> Article:
+    lock_article(db, article, user, revision)
     if article.status not in {ArticleStatus.DRAFT, ArticleStatus.CHANGES_REQUESTED}:
         raise HTTPException(status_code=409, detail="Only editable drafts can be changed")
     current = db.scalar(
@@ -126,6 +141,8 @@ def update_article(db: Session, article: Article, user: User, data: ArticleUpdat
     article.title = title
     article.summary = summary
     article.current_version = new_version
+    article.revision += 1
+    article.approved_version = None
     db.add(
         ArticleVersion(
             article_id=article.id,
@@ -152,8 +169,10 @@ def transition_article(
     details: dict[str, object] | None = None,
 ) -> Article:
     old_status = article.status
+    article.revision += 1
     article.status = to_status
     if to_status == ArticleStatus.PUBLISHED:
+        article.published_version = article.approved_version
         article.published_at = now_utc()
         article.scheduled_at = None
     add_history(
@@ -163,7 +182,7 @@ def transition_article(
         action,
         old_status,
         to_status,
-        details,
+        {**(details or {}), "version": article.current_version, "revision": article.revision},
     )
     add_outbox(db, f"article.{to_status}", article_payload(article))
     db.commit()
@@ -171,19 +190,21 @@ def transition_article(
     return article
 
 
-def submit_article(db: Session, article: Article, user: User) -> Article:
-    require_article_access(article, user)
+def submit_article(db: Session, article: Article, user: User, revision: int) -> Article:
+    lock_article(db, article, user, revision)
     if article.status not in {ArticleStatus.DRAFT, ArticleStatus.CHANGES_REQUESTED}:
         raise HTTPException(status_code=409, detail="Article cannot be submitted from this state")
     return transition_article(db, article, user, ArticleStatus.IN_REVIEW, "submitted")
 
 
 def review_article(
-    db: Session, article: Article, editor: User, action: str, reason: str | None
+    db: Session, article: Article, editor: User, action: str, reason: str | None, revision: int
 ) -> Article:
+    lock_article(db, article, editor, revision)
     if article.status != ArticleStatus.IN_REVIEW:
         raise HTTPException(status_code=409, detail="Article is not awaiting review")
     if action == "approve":
+        article.approved_version = article.current_version
         return transition_article(db, article, editor, ArticleStatus.APPROVED, "approved")
     return transition_article(
         db,
@@ -195,7 +216,10 @@ def review_article(
     )
 
 
-def schedule_article(db: Session, article: Article, editor: User, publish_at: datetime) -> Article:
+def schedule_article(
+    db: Session, article: Article, editor: User, publish_at: datetime, revision: int
+) -> Article:
+    lock_article(db, article, editor, revision)
     if article.status != ArticleStatus.APPROVED:
         raise HTTPException(status_code=409, detail="Only approved articles can be scheduled")
     if publish_at.tzinfo is None or publish_at <= now_utc():
@@ -213,13 +237,15 @@ def schedule_article(db: Session, article: Article, editor: User, publish_at: da
     )
 
 
-def publish_article(db: Session, article: Article, editor: User) -> Article:
+def publish_article(db: Session, article: Article, editor: User, revision: int) -> Article:
+    lock_article(db, article, editor, revision)
     if article.status not in {ArticleStatus.APPROVED, ArticleStatus.SCHEDULED}:
         raise HTTPException(status_code=409, detail="Article cannot be published from this state")
     return transition_article(db, article, editor, ArticleStatus.PUBLISHED, "published")
 
 
-def archive_article(db: Session, article: Article, editor: User) -> Article:
+def archive_article(db: Session, article: Article, editor: User, revision: int) -> Article:
+    lock_article(db, article, editor, revision)
     if article.status != ArticleStatus.PUBLISHED:
         raise HTTPException(status_code=409, detail="Only published articles can be archived")
     return transition_article(db, article, editor, ArticleStatus.ARCHIVED, "archived")
@@ -254,27 +280,34 @@ def get_import_job(db: Session, job_id: UUID) -> ImportJob:
     return job
 
 
-def process_import_job(db: Session, job_id: UUID) -> ImportJob:
-    job = db.scalar(
-        select(ImportJob)
-        .where(ImportJob.id == job_id)
-        .options(selectinload(ImportJob.items))
-        .with_for_update()
-    )
-    if job is None:
-        raise LookupError("Import job not found")
-    if job.status in {ImportStatus.COMPLETED, ImportStatus.COMPLETED_WITH_ERRORS}:
-        return job
-    job.status = ImportStatus.PROCESSING
-    job.started_at = job.started_at or now_utc()
-    db.flush()
-    processed = 0
-    failed = 0
-    for item in job.items:
-        if item.status != ImportItemStatus.PENDING:
-            processed += 1
-            failed += int(item.status == ImportItemStatus.FAILED)
-            continue
+def process_import_job(db: Session, job_id: UUID, *, max_items: int = 100) -> ImportJob:
+    for _ in range(max_items):
+        job = db.scalar(
+            select(ImportJob)
+            .where(ImportJob.id == job_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if job is None:
+            raise LookupError("Задание импорта не найдено")
+        if job.status in {
+            ImportStatus.COMPLETED,
+            ImportStatus.COMPLETED_WITH_ERRORS,
+            ImportStatus.FAILED,
+        }:
+            return get_import_job(db, job.id)
+        if job.next_attempt_at > now_utc():
+            return get_import_job(db, job.id)
+        item = db.scalar(
+            select(ImportItem)
+            .where(ImportItem.job_id == job.id, ImportItem.status == ImportItemStatus.PENDING)
+            .order_by(ImportItem.position)
+            .limit(1)
+        )
+        if item is None:
+            break
+        job.status = ImportStatus.PROCESSING
+        job.started_at = job.started_at or now_utc()
         try:
             with db.begin_nested():
                 article = Article(
@@ -300,19 +333,61 @@ def process_import_job(db: Session, job_id: UUID) -> ImportJob:
                 )
                 add_outbox(db, "article.imported", article_payload(article))
                 db.flush()
-            item.status = ImportItemStatus.IMPORTED
-            item.article_id = article.id
-        except IntegrityError:
-            item.status = ImportItemStatus.FAILED
-            item.error = "Slug already exists"
-            failed += 1
-        processed += 1
-    job.processed_items = processed
-    job.failed_items = failed
-    job.status = ImportStatus.COMPLETED_WITH_ERRORS if failed else ImportStatus.COMPLETED
-    job.completed_at = now_utc()
-    db.commit()
-    return get_import_job(db, job.id)
+            item.status, item.article_id = ImportItemStatus.IMPORTED, article.id
+        except IntegrityError as exc:
+            if (
+                getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
+                != "articles_slug_key"
+            ):
+                raise
+            item.status, item.error = ImportItemStatus.FAILED, "Slug уже занят"
+            job.failed_items += 1
+        job.processed_items += 1
+        job.error = None
+        if job.processed_items == job.total_items:
+            job.status = (
+                ImportStatus.COMPLETED_WITH_ERRORS if job.failed_items else ImportStatus.COMPLETED
+            )
+            job.completed_at = now_utc()
+        # Прогресс строки фиксируется вместе со статьёй: падение не откатывает готовые строки.
+        db.commit()
+    return get_import_job(db, job_id)
+
+
+def process_next_import() -> bool:
+    from publishflow.db import SessionLocal
+
+    job_id = None
+    try:
+        with SessionLocal() as db:
+            job_id = db.scalar(
+                select(ImportJob.id)
+                .where(
+                    ImportJob.status.in_([ImportStatus.PENDING, ImportStatus.PROCESSING]),
+                    ImportJob.next_attempt_at <= now_utc(),
+                )
+                .order_by(ImportJob.next_attempt_at, ImportJob.created_at)
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            )
+            if job_id is None:
+                return False
+            process_import_job(db, job_id, max_items=10)
+        return True
+    except Exception:
+        if job_id is not None:
+            with SessionLocal.begin() as db:
+                job = db.scalar(select(ImportJob).where(ImportJob.id == job_id).with_for_update())
+                if job is not None and job.status in {
+                    ImportStatus.PENDING,
+                    ImportStatus.PROCESSING,
+                }:
+                    job.attempts += 1
+                    job.error = "Сбой обработки; подробности в журнале worker"
+                    job.next_attempt_at = now_utc() + timedelta(seconds=min(300, 2**job.attempts))
+                    if job.attempts >= 5:
+                        job.status = ImportStatus.FAILED
+        raise
 
 
 def publish_due_articles(db: Session) -> int:
@@ -323,12 +398,17 @@ def publish_due_articles(db: Session) -> int:
                 Article.status == ArticleStatus.SCHEDULED,
                 Article.scheduled_at <= now_utc(),
             )
+            .order_by(Article.scheduled_at, Article.id)
+            .limit(100)
             .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
         )
     )
     for article in articles:
         old_status = article.status
+        article.revision += 1
         article.status = ArticleStatus.PUBLISHED
+        article.published_version = article.approved_version
         article.published_at = now_utc()
         article.scheduled_at = None
         add_history(

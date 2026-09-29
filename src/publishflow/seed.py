@@ -28,17 +28,17 @@ def seed_database() -> None:
     settings = get_settings()
     ensure_user(
         str(settings.admin_email),
-        "PublishFlow Admin",
+        "Администратор PublishFlow",
         settings.admin_password.get_secret_value(),
         UserRole.ADMIN,
     )
     ensure_user(
         str(settings.editor_email),
-        "PublishFlow Editor",
+        "Редактор PublishFlow",
         settings.editor_password.get_secret_value(),
         UserRole.EDITOR,
     )
-    logger.info("Seed completed")
+    logger.info("Демонстрационные учётные записи подготовлены")
 
 
 if __name__ == "__main__":
