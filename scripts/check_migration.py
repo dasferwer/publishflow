@@ -1,5 +1,11 @@
 """Проверить сохранность данных при откате и повторном применении новой миграции."""
 
+# ruff: noqa: E402
+from publishflow.test_safety import ensure_test_environment
+
+# До engine, снимка данных и создания временной БД проверяем исходный профиль.
+ensure_test_environment()
+
 import hashlib
 import json
 import subprocess

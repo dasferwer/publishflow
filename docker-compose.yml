@@ -133,6 +133,7 @@ services:
       target: test
     profiles: ["test"]
     environment:
+      TESTING: "true"
       PUBLISHFLOW_DATABASE_URL: postgresql+psycopg://publishflow:publishflow@database-test:5432/publishflow_test
       PUBLISHFLOW_RABBITMQ_URL: amqp://publishflow:publishflow@rabbitmq-test:5672/%2F
       PUBLISHFLOW_JWT_SECRET: test-publishflow-secret-at-least-32-bytes-long
